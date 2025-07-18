@@ -5,6 +5,10 @@ import polars as pl
 import plotly.graph_objects as go
 from typing import Dict
 
+import tempfile 
+import shutil
+from pathlib import Path
+
 #%% Logging functions (directory-local)
 
 def get_conversion_log_path(dirpath: str) -> str:
@@ -23,20 +27,71 @@ def save_conversion_log(log_path: str, log_data: Dict[str, float]):
 #%% Core conversion functions
 
 def retrieve_column_names(filepath: str):
+    keywords = {"Rec#", "Cyc#", "State", "DPt-Time"}
     with open(filepath, "r") as f:
-        f.readline()  # Skip line 1
-        raw_header = f.readline()
-    return raw_header.strip().replace(" ", "\t").split("\t")
+        for i, line in enumerate(f):
+            word_list = line.strip().replace(" ", "\t").split("\t")
+            if keywords.issubset(set(word_list)):
+                return i, word_list
+    raise ValueError(f"Column names {keywords} not found in file.")
 
-def load_dataframe(filepath: str, column_names: list[str]) -> pl.DataFrame:
+
+def load_dataframe(filepath: str, column_names: list[str], skip_rows:int) -> pl.DataFrame:
     return pl.read_csv(
         filepath,
         separator="\t",
         has_header=False,
-        skip_rows=2,
+        skip_rows=skip_rows,
         new_columns=column_names,
-        truncate_ragged_lines=True
+        truncate_ragged_lines=True,
     )
+
+
+
+def load_dataframe_large(filepath: str, column_names: list[str], chunk_rows: int = 500_000) -> pl.DataFrame:
+    """
+    Convert a large CSV to a single Parquet file without exhausting RAM.
+
+    Reads the CSV in `chunk_rows` sized batches, converts each chunk to Parquet in
+    a temporary directory, then consolidates them into one Parquet file. It returns
+    a *LazyFrame* pointing to the combined dataset so you can keep working lazily
+    and call `.collect()` only when you actually need the data in memory.
+
+    - csv_path : path to the input CSV
+    - out_path : path for the consolidated Parquet
+    - chunk_rows : rows per chunk (tune to taste, default 500k)
+    """
+
+    tmp = Path(tempfile.mkdtemp())          # 1) scratch space for chunk files
+    try:
+        skip, part = 1, 0
+        while True:                         # 2) stream CSV → small Parquet chunks
+            df = pl.read_csv(
+                filepath,
+                separator="\t",
+                has_header=False,
+                skip_rows=skip + (1 if part==0 else -1),
+                n_rows=chunk_rows,
+                new_columns=column_names,
+                truncate_ragged_lines=True,
+            )
+            if df.height == 0:              # no more rows → stop
+                break
+            df.write_parquet(tmp / f"{part:05}.parquet")
+            skip += df.height
+            part = part + 1
+
+        # Build lazy concatenation and write final parquet
+        lazy_df = pl.concat(
+            pl.scan_parquet(p) for p in sorted(tmp.glob("*.parquet"))
+        )
+        #lazy_df.sink_parquet(out_path, compression="zstd")
+        return lazy_df
+    finally:
+        shutil.rmtree(tmp)                  # 4) clean up
+
+
+
 
 def format_dataframe_to_bdf(df: pl.DataFrame) -> pl.DataFrame:
     return df.select([
@@ -75,7 +130,7 @@ def plot_bdf_quantities(df: pl.DataFrame, title: str = "Battery Data"):
 #%% Main runner
 
 if __name__ == "__main__":
-    root_file_path = r"D:\GITT_IntelLiGent\exported data_10-06-2025"
+    root_file_path = r"C:\Users\eibarc\Downloads\OneDrive_2025-07-18\PAA unmodified_B-37-01"
 
     for dirpath, _, filenames in os.walk(root_file_path):
         log_path = get_conversion_log_path(dirpath)
@@ -96,8 +151,8 @@ if __name__ == "__main__":
 
             print(f"Processing: {filepath}")
             try:
-                column_names = retrieve_column_names(filepath)
-                df = load_dataframe(filepath=filepath, column_names=column_names)
+                header_location, column_names = retrieve_column_names(filepath)
+                df = load_dataframe(filepath=filepath, column_names=column_names, skip_rows=header_location+1)
                 df_bdf = format_dataframe_to_bdf(df=df)
                 save_df_to_parquet(df_bdf, output_filepath=filepath)
                 updated_log[rel_path_key] = mod_time
